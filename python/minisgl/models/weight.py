@@ -1,3 +1,14 @@
+# =============================================================================
+# weight.py — 权重加载器
+#
+# 负责从 HuggingFace 格式的 safetensors checkpoint 中流式加载权重，
+# 并在加载过程中完成两件事：
+#   1. 张量并行切分（_shard_tensor）：按 TP rank 切分各投影矩阵
+#   2. 投影合并（_MERGE_GROUPS）：把 q/k/v 合并为 qkv_proj，gate/up 合并为 gate_up_proj
+#   3. MoE 专家打包（_get_expert_stack_info）：把 experts.<idx>.<name> 按索引收集后 stack
+#
+# 采用流式（yield）方式，峰值 CPU 内存 = 一个完整张量 + 一个小合并缓冲。
+# =============================================================================
 from __future__ import annotations
 
 import glob
@@ -10,10 +21,13 @@ from minisgl.distributed import get_tp_info
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
+# 按 dim=0 切分的投影（输出维度切分）：q/k/v/gate/up
 _SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
+# 按 dim=1 切分的投影（输入维度切分）：o/down
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
 
 # Merge groups: individual projections -> fused projection
+# 合并组：把独立的投影合并为融合投影（q/k/v -> qkv，gate/up -> gate_up）
 _MERGE_GROUPS = {
     ".q_proj": (".qkv_proj", ("q", "k", "v")),
     ".k_proj": (".qkv_proj", ("q", "k", "v")),
@@ -21,6 +35,7 @@ _MERGE_GROUPS = {
     ".gate_proj": (".gate_up_proj", ("gate", "up")),
     ".up_proj": (".gate_up_proj", ("gate", "up")),
 }
+# 每个投影在合并张量中的槽位名
 _SLOT_NAMES = {
     ".q_proj": "q",
     ".k_proj": "k",
@@ -28,14 +43,24 @@ _SLOT_NAMES = {
     ".gate_proj": "gate",
     ".up_proj": "up",
 }
+# 匹配 MoE 专家权重名：...experts.<idx>.<name>
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
-    """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+    """Extract rank r's shard from a single tensor. Returns a contiguous copy.
+
+    从单个张量中提取 rank r 的分片（返回连续副本）。
+    按 key 类型分派：
+        - dim0 切分（q/k/v/gate/up）：KV 头数小于 TP 数时按头切分，否则按行均分
+        - dim1 切分（o/down）：按列均分
+        - lm_head / embed_tokens：按词表范围切分
+        - 其余：原样返回
+    """
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
+            # KV 头数小于 TP 数：按头切分，每个 rank 拿一部分头
             head_dim = value.shape[0] // num_kv_heads
             head_idx = r * num_kv_heads // n
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
@@ -43,6 +68,7 @@ def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: i
     elif any(key.count(sub) for sub in _SPLIT_DIM_1):
         return value.chunk(n, dim=1)[r].clone()
     elif key.count("lm_head") or key.count("embed_tokens"):
+        # 词表并行：按词表范围切分
         num_embeddings = value.shape[0]
         num_embeddings_per_partition = div_ceil(num_embeddings, n)
         vocab_start_idx = r * num_embeddings_per_partition
@@ -53,7 +79,10 @@ def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: i
 
 
 def _get_merge_info(key: str):
-    """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
+    """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None.
+
+    若 key 属于某个合并组，返回 (合并后的 key, 当前槽位, 全部槽位)；否则返回 None。
+    """
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
         if key.count(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
@@ -61,7 +90,11 @@ def _get_merge_info(key: str):
 
 
 def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
-    """Map an expert-scoped checkpoint key to the packed runtime key."""
+    """Map an expert-scoped checkpoint key to the packed runtime key.
+
+    把 checkpoint 中 experts.<idx>.<name> 形式的 key 映射为运行时打包 key
+    experts.<packed_name> 及专家索引 idx。
+    """
     match = _EXPERT_PATTERN.match(key)
     if match is None:
         return None
@@ -74,7 +107,11 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
 
 def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
-    and on device. Peak CPU memory: one full tensor + a small merge buffer."""
+    and on device. Peak CPU memory: one full tensor + a small merge buffer.
+
+    流式权重加载器：yield (name, tensor)，张量已完成切分、合并并位于目标设备。
+    峰值 CPU 内存：一个完整张量 + 一个小合并缓冲。
+    """
     from .config import ModelConfig
 
     model_folder = download_hf_weight(model_path)
@@ -84,12 +121,15 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     tp_info = get_tp_info()
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
+    # 合并组缓冲：merged_key -> {槽位: 张量}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    # MoE 专家缓冲：packed_key -> {专家索引: 张量}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
                 # Strip multimodal wrapper prefix, skip vision/projector weights
+                # 去掉多模态包装前缀，跳过视觉/投影权重
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
                 raw = f.get_tensor(name)
@@ -100,6 +140,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 if (info := _get_merge_info(name)) is None:
                     out = (name, tensor)
                 else:
+                    # 属于合并组：先缓存到 merge_buf，等所有槽位到齐后拼接
                     merged_key, slot, all_slots = info
                     merge_buf.setdefault(merged_key, {})[slot] = tensor
                     if not all(s in merge_buf[merged_key] for s in all_slots):
@@ -109,6 +150,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     out = (merged_key, torch.cat(parts, dim=0))
 
                 if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
+                    # MoE 专家：按索引收集，等所有专家到齐后 stack 打包
                     packed_key, expert_idx = expert_info
                     slots = expert_buf.setdefault(packed_key, {})
                     slots[expert_idx] = out[1]
@@ -120,5 +162,6 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 else:  # Normal dense model
                     yield out[0], out[1]
 
+    # 结束时断言缓冲为空，防止 checkpoint 不完整
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"

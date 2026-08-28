@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 
 def _next_power_of_2(n: int) -> int:
+    """返回大于等于 n 的最小 2 的幂。"""
     if n <= 1:
         return 1
     return 1 << math.ceil(math.log2(n))
@@ -34,17 +35,27 @@ logger = init_logger(__name__)
 
 @dataclass
 class FICaptureData(BaseCaptureData):
+    """FlashInfer 的 CUDA Graph 捕获数据。"""
+
     @property
     def one_tensor(self) -> torch.Tensor:
+        """返回 seq_lens 作为"单张量"（FlashInfer 的 last_page_len 缓冲）。"""
         return self.seq_lens
 
     @property
     def indices(self) -> torch.Tensor:
+        """返回 page_table 作为 ragged indices（FlashInfer 的索引缓冲）。"""
         return self.page_table
 
 
 @dataclass
 class FIMetadata(BaseAttnMetadata):
+    """FlashInfer 注意力元数据。
+
+    FlashInfer 的 plan 接口需要 CPU 上的 indptr/indices/last_page_len 等，
+    因此这里同时保存 CPU 与 GPU 版本。目前仅支持 page_size=1。
+    """
+
     # fmt: off
     cu_seqlens_q_cpu:   torch.Tensor  # on cpu
     cu_seqlens_k_cpu:   torch.Tensor  # on cpu
@@ -63,7 +74,9 @@ class FIMetadata(BaseAttnMetadata):
     # fmt: on
 
     def __post_init__(self) -> None:
+        # 目前只支持 page_size=1
         assert self.page_size == 1, "Currently only page_size=1 is supported."
+        # 校验各张量所在设备符合预期
         assert (
             self.cu_seqlens_k_cpu.is_cpu
             and self.cu_seqlens_q_cpu.is_cpu
@@ -74,10 +87,17 @@ class FIMetadata(BaseAttnMetadata):
         )
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
+        """返回每个序列最后一个 token 的位置（decode 取 logits 用）。"""
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
 
 class FlashInferBackend(BaseAttnBackend):
+    """基于 FlashInfer 的注意力后端。
+
+    依赖 `flashinfer` 库，使用分页 KV 缓存 wrapper（prefill/decode 各一个），
+    目前仅支持 page_size=1。同样支持 CUDA Graph 捕获/回放。
+    """
+
     def __init__(self, config: ModelConfig) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -87,6 +107,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
+        # FlashInfer 需要一块 workspace 缓冲
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
@@ -103,11 +124,13 @@ class FlashInferBackend(BaseAttnBackend):
         )
 
         # NOTE: some hack to reuse the int_workspace_buffer
+        # 复用 prefill wrapper 的 int workspace，减少内存占用
         self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
         self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
 
         # initialize some data members
         tp_size = get_tp_info().size
+        # 计算本进程负责的 QO/KV 头数（TP 切分，KV 允许复制）
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
 
@@ -117,10 +140,17 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
+        # 用于同步 plan 阶段的异步 H2D 拷贝
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
+        """对 metadata 执行一次 FlashInfer plan（只做一次，之后复用）。
+
+        FlashInfer 的 plan 会复用一块固定的 pinned host staging buffer，
+        并启动一次异步 H2D 拷贝；因此在下次 plan 修改该 host buffer 之前，
+        必须先等待上次拷贝完成（用 last_event 同步）。
+        """
         if metadata.initialized:
             return
 
@@ -131,6 +161,7 @@ class FlashInferBackend(BaseAttnBackend):
         # async H2D copy. Wait here before the next plan mutates that host buffer.
         self.last_event.synchronize()
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
+            # decode 阶段：plan 一次，之后每次 run 复用
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
                 indices=metadata.indices,
@@ -147,6 +178,7 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
             )
         else:
+            # prefill 阶段：plan 一次
             metadata.wrapper.plan(
                 qo_indptr=metadata.cu_seqlens_q_cpu,
                 paged_kv_indptr=metadata.cu_seqlens_k_cpu,
@@ -166,6 +198,10 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event.record()
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
+        """返回长度为 bs 的全 1 CPU 张量（作为 last_page_len，page_size=1 时每页都满）。
+
+        按 2 的幂缓存，避免频繁分配。
+        """
         if bs <= len(self.cached_ones_cpu):
             return self.cached_ones_cpu[:bs]
         # padding to next pow of 2
@@ -177,23 +213,25 @@ class FlashInferBackend(BaseAttnBackend):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
         def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
+            # 把 (num_pages, page_size=1, heads, dim) 展平为 (num_pages, 1, heads, dim)
             return cache.view(-1, 1, cache.shape[2], cache.shape[3])
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        self._initialize_metadata_once(metadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        self._initialize_metadata_once(metadata)  # 首次调用时执行 plan
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)  # 写入分页缓存
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:
+        """根据 batch 生成 FIMetadata（FlashInfer 需要 CPU 上的 indptr 等）。"""
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
+        seqlens_q = [req.extend_len for req in reqs]  # 本次新计算的 token 数
+        seqlens_k = [req.device_len for req in reqs]  # 缓存中的总长度
+        cached_lens = [req.cached_len for req in reqs]  # 命中的前缀长度
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
@@ -212,6 +250,7 @@ class FlashInferBackend(BaseAttnBackend):
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
+            # FlashInfer 的 indices 是展平的一维页号序列（page_size=1）
             indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
@@ -225,6 +264,7 @@ class FlashInferBackend(BaseAttnBackend):
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+        """初始化 CUDA Graph 捕获缓冲。"""
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
@@ -235,6 +275,7 @@ class FlashInferBackend(BaseAttnBackend):
 
     @cached_property
     def use_tensor_cores(self) -> bool:
+        """是否使用 Tensor Core（GQA 比例 >= 4 时启用，可用环境变量覆盖）。"""
         if (overriden_value := ENV.FLASHINFER_USE_TENSOR_CORES.value) is not None:
             logger.warning(f"Overriding FlashInfer tensor core usage to {overriden_value}")
             return overriden_value
@@ -242,11 +283,13 @@ class FlashInferBackend(BaseAttnBackend):
         return GQA >= 4
 
     def prepare_for_capture(self, batch: Batch) -> None:
+        """捕获前：为当前 batch 大小创建 CUDA Graph decode wrapper 并 plan。"""
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
         capture = self.capture
+        # 为每个 batch 大小创建一个专用的 Graph wrapper
         self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
@@ -264,6 +307,7 @@ class FlashInferBackend(BaseAttnBackend):
         self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
+        """回放前：把真实元数据拷贝到捕获缓冲，并复用已捕获的 Graph wrapper。"""
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs

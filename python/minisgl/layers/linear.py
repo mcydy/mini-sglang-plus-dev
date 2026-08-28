@@ -1,3 +1,17 @@
+# =============================================================================
+# linear.py — 张量并行线性层
+#
+# 实现支持张量并行(TP)的各类线性层：
+#   - LinearReplicated      : 权重全量复制（每卡持有完整矩阵，用于 MoE router gate）
+#   - LinearColParallelMerged: 列并行合并（多个输出维度各自按 TP 切分后拼接，用于 gate_up_proj）
+#   - LinearQKVMerged       : QKV 合并投影（Q/KV 头按 TP 切分，用于 qkv_proj）
+#   - LinearOProj           : 输出投影（行并行，forward 后 all_reduce，用于 o_proj）
+#   - LinearRowParallel     : 行并行（输入按 TP 切分，输出后 all_reduce，用于 down_proj）
+#
+# 张量并行约定：
+#   - 列并行（qkv/gate_up）：切分输出维度，各卡计算不同输出分片
+#   - 行并行（o/down）：切分输入维度，各卡计算部分和，再 all_reduce 汇总
+# =============================================================================
 from __future__ import annotations
 
 from typing import List
@@ -11,7 +25,11 @@ from .base import BaseOP
 
 
 class _LinearTPImpl(BaseOP):
-    """Real implementation of a linear layer with tensor parallelism."""
+    """Real implementation of a linear layer with tensor parallelism.
+
+    张量并行线性层的实现基类：记录 full/local 输入输出维度，
+    weight 形状为 (local_osize, local_isize)，forward 用 F.linear。
+    """
 
     def __init__(
         self,
@@ -36,6 +54,8 @@ class LinearReplicated(_LinearTPImpl):
     """
     Linear layer where weights are replicated (not sharded) across all TP ranks.
     Each GPU holds the full weight matrix.
+
+    权重全量复制的线性层：每张卡持有完整权重矩阵（不切分）。
     """
 
     def __init__(
@@ -54,6 +74,11 @@ class LinearReplicated(_LinearTPImpl):
 
 
 class LinearColParallelMerged(_LinearTPImpl):
+    """列并行合并线性层：多个输出维度各自按 TP 切分后拼接。
+
+    用于 gate_up_proj（输出 [intermediate, intermediate] 两个维度）。
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -69,6 +94,11 @@ class LinearColParallelMerged(_LinearTPImpl):
 
 
 class LinearQKVMerged(_LinearTPImpl):
+    """QKV 合并投影：Q 头按 TP 切分、KV 头按 TP 切分。
+
+    allow_replicate=True 表示 KV 头数小于 TP 数时允许复制（每卡持有完整 KV 头）。
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -89,6 +119,11 @@ class LinearQKVMerged(_LinearTPImpl):
 
 
 class LinearOProj(_LinearTPImpl):
+    """输出投影（行并行）：输入按 TP 切分，输出后 all_reduce 汇总。
+
+    用于 o_proj（注意力输出投影）。
+    """
+
     def __init__(self, input_size: int, output_size: int, has_bias: bool):
         tp_info = get_tp_info()
         full_isize = input_size
@@ -107,6 +142,11 @@ class LinearOProj(_LinearTPImpl):
 
 
 class LinearRowParallel(_LinearTPImpl):
+    """行并行线性层：输入按 TP 切分，输出后 all_reduce 汇总。
+
+    用于 down_proj（MLP 输出投影）。
+    """
+
     def __init__(
         self,
         input_size: int,

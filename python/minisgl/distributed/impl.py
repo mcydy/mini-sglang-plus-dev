@@ -14,19 +14,25 @@ if TYPE_CHECKING:
 
 @dataclass
 class DistributedImpl(ABC):
-    @abstractmethod
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor: ...
+    """分布式通信实现抽象基类：定义张量并行所需的集合通信接口。"""
 
     @abstractmethod
-    def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """对张量 x 做全归约（求和），返回归约后的张量。"""
+
+    @abstractmethod
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        """沿第 0 维对张量 x 做全收集，返回拼接后的张量。"""
 
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
+    """基于 torch.distributed 的默认实现。"""
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = dist.get_world_size()
         if tp_size == 1:
-            return x
+            return x  # 单卡无需通信
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
         return x
 
@@ -35,7 +41,7 @@ class TorchDistributedImpl(DistributedImpl):
         if tp_size == 1:
             return x
         shape = list(x.shape)
-        shape[0] = shape[0] * tp_size
+        shape[0] = shape[0] * tp_size  # 第 0 维扩大 tp_size 倍
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(out, x)
         return out
@@ -43,6 +49,8 @@ class TorchDistributedImpl(DistributedImpl):
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
+    """基于 PyNCCL（自定义 CUDA 内核）的实现，用于覆盖默认 torch 实现。"""
+
     comm: PyNCCLCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -61,6 +69,12 @@ class PyNCCLDistributedImpl(DistributedImpl):
 
 
 class DistributedCommunicator:
+    """分布式通信器：插件式设计，默认使用 torch 实现。
+
+    通过 plugins 列表管理多个实现，实际调用时使用列表末尾的插件
+    （后追加的插件优先级更高，用于覆盖默认实现）。
+    """
+
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -74,10 +88,12 @@ def enable_pynccl_distributed(
     tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
 ) -> None:
     """
-    Enable PyNCCL-based distributed communication for tensor parallelism.
+    启用基于 PyNCCL 的分布式通信（用于张量并行）。
+
+    把 PyNCCL 实现追加到插件列表末尾，从而覆盖默认的 torch 实现。
     """
     if tp_info.size == 1:
-        return
+        return  # 单卡无需启用
     from minisgl.kernel import init_pynccl
 
     comm = init_pynccl(
@@ -92,6 +108,6 @@ def enable_pynccl_distributed(
 
 def destroy_distributed() -> None:
     """
-    Destroy all the distributed communication plugins.
+    销毁所有分布式通信插件。
     """
     DistributedCommunicator.plugins = []

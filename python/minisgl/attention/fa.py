@@ -16,11 +16,21 @@ if TYPE_CHECKING:
 
 @dataclass
 class FACaptureData(BaseCaptureData):
+    """FlashAttention 的 CUDA Graph 捕获数据（复用基类的缓冲）。"""
+
     pass
 
 
 @dataclass
 class FAMetadata(BaseAttnMetadata):
+    """FlashAttention 注意力元数据。
+
+    - cu_seqlens_k / cu_seqlens_q：K/Q 序列的累积长度（flash_attn 的 varlen 接口需要）
+    - cache_seqlens：每个序列在缓存中的总长度
+    - max_seqlen_k / max_seqlen_q：K/Q 的最大序列长度
+    - page_table：分页 KV 缓存的页表（每行是一个序列的页号序列）
+    """
+
     cu_seqlens_k: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cache_seqlens: torch.Tensor
@@ -30,19 +40,27 @@ class FAMetadata(BaseAttnMetadata):
     page_table: torch.Tensor
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
+        """返回每个序列最后一个 token 的位置（cu_seqlens_q 相邻差 1 即最后位置）。"""
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
 
 class FlashAttentionBackend(BaseAttnBackend):
+    """基于 sgl_kernel（分页 KV 缓存版 flash_attn）的注意力后端。
+
+    依赖 `sgl_kernel.flash_attn.flash_attn_with_kvcache`，支持分页 KV 缓存
+    与 CUDA Graph 捕获/回放。
+    """
+
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
         self.config = config
-        self.kvcache = ctx.kv_cache
+        self.kvcache = ctx.kv_cache  # 物理 KV 缓存池
         self.page_size = ctx.page_size
-        self.capture: FACaptureData | None = None
+        self.capture: FACaptureData | None = None  # CUDA Graph 捕获缓冲
         self.max_graph_bs = 0
-        self.capture_bs: List[int] = []
-        self.scale = config.head_dim**-0.5
+        self.capture_bs: List[int] = []  # 捕获的 batch 大小列表
+        self.scale = config.head_dim**-0.5  # softmax 缩放因子
+        # 根据 GPU 架构选择 flash_attn 版本（SM100 用 v4，否则 v3）
         self.version = 4 if is_sm100_supported() else 3
 
     def forward(
@@ -50,7 +68,9 @@ class FlashAttentionBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
+        # 先把本层新算出的 k/v 写入分页缓存
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        # 调用 sgl_kernel 的分页 flash_attn
         return _fa_sgl_impl(
             q=q,
             k_cache=self.kvcache.k_cache(layer_id),
@@ -65,12 +85,13 @@ class FlashAttentionBackend(BaseAttnBackend):
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
+        """根据 batch 中的请求信息生成 FAMetadata。"""
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
+        seqlens_q = [req.extend_len for req in reqs]  # 本次新计算的 token 数
+        seqlens_k = [req.device_len for req in reqs]  # 缓存中的总长度
+        cached_lens = [req.cached_len for req in reqs]  # 命中的前缀长度
         max_seqlen_k = max(seqlens_k)
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
@@ -82,18 +103,23 @@ class FlashAttentionBackend(BaseAttnBackend):
         cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
 
         if max_seqlen_q == 1:
+            # decode 阶段：每个序列只算 1 个 token，cu_seqlens_q 就是 [0,1,2,...,bs]
             cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
+            # 纯 prefill 且无缓存命中：Q 与 K 长度一致
             cu_seqlens_q = cu_seqlens_k
         else:  # normal extend prefill, with partial cache hit
+            # 部分缓存命中的 extend prefill：Q 只包含新计算的 token
             cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
+        # NOTE: 全局页表按 page_size=1 组织，这里需要按实际页大小切片
+        new_page_table = torch.stack(
             [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
         )
         if self.page_size > 1:
+            # 页号除以页大小，得到真正的物理页号
             new_page_table.div_(self.page_size, rounding_mode="floor")
         batch.attn_metadata = FAMetadata(
             cu_seqlens_k=cu_seqlens_k,
@@ -105,6 +131,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+        """初始化 CUDA Graph 捕获缓冲（按最大 batch 大小分配）。"""
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device)
@@ -113,6 +140,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
+        """捕获前：用捕获缓冲构造元数据（decode 专用，max_seqlen_q=1）。"""
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
         metadata = FAMetadata(
@@ -126,6 +154,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         batch.attn_metadata = metadata
 
     def prepare_for_replay(self, batch: Batch) -> None:
+        """回放前：把真实元数据拷贝到捕获缓冲（保持地址不变，Graph 才能复用）。"""
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FAMetadata)
         assert self.capture is not None and bs in self.capture_bs
@@ -154,6 +183,7 @@ def _fa_sgl_impl(
     pack_gqa: bool | None = None,  # Can be tuned for speed
     causal: bool = True,
 ) -> torch.Tensor:
+    """封装 sgl_kernel 的分页 flash_attn 调用。"""
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache
     except ImportError as e:

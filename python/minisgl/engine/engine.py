@@ -1,3 +1,15 @@
+# =============================================================================
+# engine.py — 引擎（Engine）类
+#
+# Engine 是运行在单个进程上的张量并行(TP) worker，是调度器(Scheduler)的
+# "计算核心"。它负责：
+#   1. 初始化 GPU 推理环境（通信、模型、KV cache、页表、注意力后端、采样器）
+#   2. 执行前向计算（支持 CUDA graph 重放与 eager 两种模式）
+#   3. 对 logits 采样得到下一个 token
+#
+# 每个 TP rank 对应一个 Engine 实例；多个 Engine 通过 NCCL/gloo 通信协作，
+# 共同完成一个模型的张量并行推理。
+# =============================================================================
 from __future__ import annotations
 
 from datetime import timedelta
@@ -21,12 +33,32 @@ logger = init_logger(__name__)
 
 
 class ForwardOutput(NamedTuple):
+    """一次前向+采样的输出。
+
+    属性：
+        next_tokens_gpu: 采样得到的下一个 token（GPU 张量）
+        next_tokens_cpu: 同一份 token 的 CPU 副本（异步拷贝）
+        copy_done_event: CUDA 事件，用于 CPU 侧等待 GPU->CPU 拷贝完成，
+                         从而支撑"调度与计算重叠"（overlap scheduling）
+    """
+
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
 
 
 class Engine:
+    """引擎：单个 TP worker 上的推理执行器。
+
+    初始化流程：
+        1. 设置 TP 信息、设备、自定义 stream、随机种子
+        2. 初始化分布式通信（gloo+pynccl 或 nccl）
+        3. 在 meta device 上创建模型并加载权重
+        4. 按剩余显存计算 KV cache 页数并创建 KV cache 池
+        5. 创建页表、注意力后端、MoE 后端、采样器
+        6. 创建 dummy 请求并捕获 CUDA graph
+    """
+
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
@@ -86,6 +118,7 @@ class Engine:
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================
+        # dummy 请求用于把 batch 填充到 CUDA graph 捕获的固定 batch size
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -110,6 +143,12 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        """初始化分布式通信。
+
+        单卡(TP=1)或启用 PyNCCL 时：用 gloo 做 CPU 侧同步 + PyNCCL 做 GPU 通信；
+        否则：用 nccl 做 GPU 通信 + 单独建一个 gloo 组做 CPU 侧同步。
+        返回用于 CPU 侧同步的 gloo 进程组。
+        """
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -137,6 +176,11 @@ class Engine:
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        """加载模型权重为 state_dict。
+
+        使用 dummy 权重时（测试用）返回随机张量；否则从模型路径流式加载
+        safetensors 权重（load_weight 内部已完成 TP 切分与合并）。
+        """
         if config.use_dummy_weight:
             return {
                 k: torch.randn_like(v, device=self.device)
@@ -146,6 +190,11 @@ class Engine:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        """根据剩余显存计算 KV cache 可分配的页数。
+
+        每页 KV cache 大小 = 2(K+V) * head_dim * (kv_heads/TP) * page_size * dtype * num_layers。
+        可用显存 = memory_ratio * 初始空闲显存 - 模型占用的显存。
+        """
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
@@ -168,7 +217,7 @@ class Engine:
         return num_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:
-        """Get the min and max free memory across TP ranks."""
+        """获取所有 TP rank 上的最小/最大空闲显存，并校验是否均衡。"""
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -189,6 +238,14 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        """对一批请求执行前向计算并采样。
+
+        流程：
+            1. 挂载 batch 到全局上下文（模型前向时通过 ctx.batch 访问）
+            2. 能走 CUDA graph 则重放图，否则 eager 前向
+            3. 对每个请求推进长度（complete_one）
+            4. 对 logits 采样得到下一个 token，并异步拷贝到 CPU
+        """
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
@@ -206,28 +263,35 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
+        """关闭引擎：先销毁 CUDA graph，再销毁分布式进程组。"""
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
 
 def _align_up_32(num: int) -> int:
+    """把数字向上对齐到 32 的倍数（用于页表列数对齐）。"""
     return (num + 31) // 32 * 32
 
 
 def _adjust_config(config: EngineConfig):
+    """根据硬件自动调整配置（如自动选择注意力后端、强制 page_size 等）。"""
+
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
+    # 自动选择注意力后端：SM100 用 trtllm，SM90 用 fa(prefill)+fi(decode)，否则 fi
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
+    # trtllm 后端只支持 page_size 为 16/32/64，否则强制改为 64
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64]:
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
+    # MoE 模型自动选择 fused 后端
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

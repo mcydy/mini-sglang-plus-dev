@@ -1,3 +1,9 @@
+# =============================================================================
+# qwen3.py — Qwen3 模型实现
+#
+# 实现 Qwen3 系列因果语言模型。结构与 Llama 几乎一致，唯一区别是
+# Qwen3 的注意力带 QK 归一化（has_qk_norm=True），即对 Q 和 K 分别做 RMSNorm。
+# =============================================================================
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
@@ -16,6 +22,11 @@ if TYPE_CHECKING:
 
 
 class Qwen3DecoderLayer(BaseOP):
+    """Qwen3 单层解码器。
+
+    与 Llama 的区别：self_attn 使用带 QK 归一化的 Qwen3Attn。
+    """
+
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
         self.mlp = Qwen3MLP(config)
@@ -34,6 +45,7 @@ class Qwen3DecoderLayer(BaseOP):
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向：残差流方式依次经过归一化、注意力、归一化、MLP。"""
         x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
@@ -42,6 +54,8 @@ class Qwen3DecoderLayer(BaseOP):
 
 
 class Qwen3Model(BaseOP):
+    """Qwen3 主干模型：词嵌入 + 多层解码器 + 末尾归一化。"""
+
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -56,6 +70,7 @@ class Qwen3Model(BaseOP):
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """前向：嵌入 -> 逐层残差流 -> 末尾归一化，返回隐藏状态。"""
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
@@ -64,6 +79,8 @@ class Qwen3Model(BaseOP):
 
 
 class Qwen3ForCausalLM(BaseLLMModel):
+    """Qwen3 因果语言模型：主干 + LM Head，输出 logits。"""
+
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(
@@ -75,6 +92,7 @@ class Qwen3ForCausalLM(BaseLLMModel):
         super().__init__()
 
     def forward(self) -> torch.Tensor:
+        """前向：从全局上下文取当前 batch 的 input_ids，输出 logits。"""
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)
         return logits

@@ -1,3 +1,17 @@
+# =============================================================================
+# scheduler.py — 调度器（Scheduler）主类
+#
+# Scheduler 运行在每个 TP worker 进程上，是系统的"调度大脑"。它负责：
+#   1. 从 tokenizer 接收请求消息（UserMsg），并分发处理
+#   2. 调度 prefill / decode 批次（PrefillManager / DecodeManager）
+#   3. 准备批次数据（页分配、位置编码、注意力元数据）
+#   4. 调用 Engine 执行前向 + 采样
+#   5. 处理结果、释放资源、把输出 token 发回 detokenizer
+#
+# 主循环支持两种模式：
+#   - overlap_loop（默认）：调度与执行重叠，隐藏 CPU 调度延迟
+#   - normal_loop：串行版本（通过环境变量 DISABLE_OVERLAP_SCHEDULING 启用）
+# =============================================================================
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
@@ -33,6 +47,15 @@ Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
+    """一次前向所需的全部输入数据（为 overlap 调度缓存，避免重复分配内存）。
+
+    属性：
+        batch: 待前向的批次
+        sample_args: 采样参数
+        input_tuple: (token_mapping, positions)，token_mapping 用于从 token_pool 取输入
+        write_tuple: (req_mapping, seq_lens)，用于把输出 token 写回 token_pool
+    """
+
     batch: Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
@@ -43,12 +66,15 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
+    """调度器：串联消息处理、批次调度、前向执行与结果回传。"""
+
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation
+        # 另开一个 stream 用于元数据处理，与 engine 的计算 stream 重叠
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
@@ -86,6 +112,9 @@ class Scheduler(SchedulerIOMixin):
 
         It will overlap the execution of current batch and processing of last batch's results,
         which can effectively hide CPU latency and improve GPU utilization.
+
+        重叠调度主循环：把"当前批次的执行"与"上一批次结果的处理"重叠起来，
+        从而隐藏 CPU 调度延迟、提高 GPU 利用率。
         """
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
@@ -106,6 +135,7 @@ class Scheduler(SchedulerIOMixin):
         return ongoing_data
 
     def normal_loop(self) -> None:
+        """串行调度主循环（不重叠，用于对比实验）。"""
         blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -119,6 +149,7 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
+        """调度器主入口：根据配置选择重叠或串行主循环，无限运行。"""
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -131,11 +162,13 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        """关闭调度器：同步设备、同步所有 rank、关闭引擎。"""
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        """处理上一批前向的结果：追加 token、判断完成、释放资源、发送 detokenize 消息。"""
         if last_data is None:
             return
 
@@ -167,6 +200,7 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
+        """分发处理一条后端消息。"""
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
                 self._process_one_msg(msg)
@@ -198,10 +232,12 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        """释放请求占用的资源：页表槽位 + KV cache 页。"""
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        """准备一个批次的前向输入：填充、分配页、构造位置/映射、准备注意力元数据。"""
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
@@ -217,6 +253,7 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        """调度下一批：优先 prefill，其次 decode。"""
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
@@ -225,6 +262,7 @@ class Scheduler(SchedulerIOMixin):
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        """执行前向：从 token_pool 取输入 -> engine 前向+采样 -> 写回 token_pool。"""
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
@@ -234,6 +272,7 @@ class Scheduler(SchedulerIOMixin):
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """为批次中每个 token 构造位置编码（用于 RoPE），按请求顺序拼接。"""
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
@@ -250,6 +289,7 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    """构造输入映射：(每个 token 所属的请求槽位, 位置编码)。"""
     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
@@ -260,6 +300,7 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    """构造输出映射：(请求槽位, 写入位置)。写入位置为 -1 表示该请求已结束。"""
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
