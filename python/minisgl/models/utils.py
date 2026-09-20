@@ -95,8 +95,11 @@ class RopeAttn(BaseOP):
         )
         self.has_qk_norm = has_qk_norm
         if has_qk_norm:
-            self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+            norm_size = getattr(config, "qk_norm_size", head_dim) #新增
+            self.q_norm = RMSNorm(norm_size, eps=config.rms_norm_eps) #新增
+            self.k_norm = RMSNorm(norm_size, eps=config.rms_norm_eps) #新增
+            # self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+            # self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None

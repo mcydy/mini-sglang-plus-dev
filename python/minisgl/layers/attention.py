@@ -58,6 +58,11 @@ class AttentionLayer(StateLessOP):
         )
         self.q_norm = q_norm
         self.k_norm = k_norm
+        # QK-norm 有两种语义，按权重长度自动区分：
+        #   - 权重长度 == 整个 q/k 维度(num_heads*head_dim)：先对整个向量 norm，再分头（OLMoE）
+        #   - 权重长度 == head_dim                        ：先分头，再对每头做 norm（Qwen3）
+        self._q_norm_full_dim = q_norm is not None and q_norm.weight.shape[0] == self.qo_attn_dim
+        self._k_norm_full_dim = k_norm is not None and k_norm.weight.shape[0] == self.kv_attn_dim
 
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         """前向：输入 QKV 合并投影输出，返回注意力输出（o_proj 的输入）。"""
@@ -65,9 +70,19 @@ class AttentionLayer(StateLessOP):
         # 按 [qo_attn_dim, kv_attn_dim, kv_attn_dim] 切分 Q/K/V
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
-            self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
+            if self._q_norm_full_dim:
+                # OLMoE：对整个 q 向量（num_qo_heads*head_dim）做归一化，之后再分头
+                self.q_norm.forward_inplace(q.view(-1, self.qo_attn_dim))
+            else:
+                # Qwen3：分头后对每个 head 的 head_dim 做归一化
+                self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
-            self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+            if self._k_norm_full_dim:
+                # OLMoE：对整个 k 向量（num_kv_heads*head_dim）做归一化
+                self.k_norm.forward_inplace(k.view(-1, self.kv_attn_dim))
+            else:
+                # Qwen3：分头后对每个 head 的 head_dim 做归一化
+                self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         # 施加 RoPE（使用当前 batch 的位置编码）
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)

@@ -124,12 +124,14 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        logger.debug(f"执行下一批batch-------------------------------------------------------")
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 ongoing_data = (forward_input, self._forward(forward_input))
+                logger.debug(f"执行完一次前向，输出 {ongoing_data} forward_input {forward_input}")
 
         self._process_last_data(last_data)
         return ongoing_data
@@ -207,7 +209,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
-            logger.debug_rank0("Received user msg: %s", msg)
+            logger.debug_rank0("后端处理进程Received user msg: %s，并加入请求列表等待调度", msg)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -240,6 +242,7 @@ class Scheduler(SchedulerIOMixin):
         """准备一个批次的前向输入：填充、分配页、构造位置/映射、准备注意力元数据。"""
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
+        logger.debug(f"batch开始位置编码")
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)

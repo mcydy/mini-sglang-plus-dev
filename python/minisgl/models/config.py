@@ -30,6 +30,7 @@ class ModelConfig:
     num_experts_per_tok: int
     moe_intermediate_size: int
     norm_topk_prob: bool
+    qk_norm_size: int          
     model_type: str
     architectures: list[str]
 
@@ -50,9 +51,14 @@ class ModelConfig:
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
+        qk_norm_size = config.hidden_size if model_type == "olmoe" else head_dim #
         num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
-        moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
+        # moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
+        moe_intermediate_size = (
+            getattr(config, "moe_intermediate_size", None)
+            or getattr(config, "intermediate_size", 0)
+        )
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
@@ -82,6 +88,7 @@ class ModelConfig:
             num_experts_per_tok=num_experts_per_tok,
             moe_intermediate_size=moe_intermediate_size,
             norm_topk_prob=norm_topk_prob,
+            qk_norm_size=qk_norm_size, 
             model_type=model_type,
             architectures=architectures,
         )

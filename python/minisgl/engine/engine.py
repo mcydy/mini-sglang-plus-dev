@@ -118,7 +118,7 @@ class Engine:
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================
-        # dummy 请求用于把 batch 填充到 CUDA graph 捕获的固定 batch size
+        # dummy 请求用于把 batch 填充到 CUDA graph 捕获的固定 batch size。造假数据输入
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -213,7 +213,7 @@ class Engine:
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
-        logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
+        logger.info(f"Allocating {num_tokens} (num_pages= {num_pages} * config.page_size = {config.page_size})tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
         return num_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:
@@ -250,8 +250,10 @@ class Engine:
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+                logger.debug(f"====cuda graph replay")
             else:
                 logits = self.model.forward()
+
 
         for req in batch.reqs:
             req.complete_one()

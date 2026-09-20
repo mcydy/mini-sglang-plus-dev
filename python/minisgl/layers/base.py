@@ -59,7 +59,26 @@ class BaseOP:
             if isinstance(param, torch.Tensor):
                 item = state_dict.pop(_concat_prefix(prefix, name))
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
+                # assert param.shape == item.shape and param.dtype == item.dtype
+
+                if param.shape != item.shape or param.dtype != item.dtype:
+                    import sys as _sys
+                    _info = {}
+                    for _k, _v in _sys._getframe().f_locals.items():
+                        if _k in ("self", "state_dict"):
+                            continue
+                        if hasattr(_v, "shape"):
+                            _info[_k] = (tuple(_v.shape), str(_v.dtype))
+                        elif isinstance(_v, (str, int, float, type(None))):
+                            _info[_k] = _v
+                    raise RuntimeError(
+                        f"\n[权重不匹配]\n"
+                        f"  期望(param): {tuple(param.shape)} {param.dtype}\n"
+                        f"  实际(item) : {tuple(item.shape)} {item.dtype}\n"
+                        f"  局部变量   : {_info}\n"
+                        f"  相关 key   : "
+                        + str([k for k in state_dict if "mlp" in k or "expert" in k][:5])
+                    )
                 setattr(self, name, item)
             elif isinstance(param, BaseOP):
                 param.load_state_dict(

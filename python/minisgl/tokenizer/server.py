@@ -62,7 +62,7 @@ def tokenize_worker(
             while len(pending_msg) < local_bs and not recv_listener.empty():
                 pending_msg.extend(_unwrap_msg(recv_listener.get()))
 
-            logger.debug(f"Received {len(pending_msg)} messages")
+            logger.debug(f"Received {pending_msg} ")
 
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
@@ -83,6 +83,7 @@ def tokenize_worker(
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]
                 send_frontend.put(batch_output)
+                logger.debug(f"detokenize返回给前端处理结果 {batch_output} ")
 
             if len(tokenize_msg) > 0:
                 tensors = tokenize_manager.tokenize(tokenize_msg)
@@ -99,6 +100,7 @@ def tokenize_worker(
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]
                 send_backend.put(batch_output)
+                logger.debug(f"tokenize发送给后端处理1 {batch_output} ")
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
@@ -106,5 +108,6 @@ def tokenize_worker(
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]
                 send_backend.put(batch_output)
+                logger.debug(f"tokenize发送给后端处理2 {batch_output} ")
     except KeyboardInterrupt:
         pass
