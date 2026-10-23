@@ -14,6 +14,26 @@ from .base import BaseCacheHandle, BasePrefixCache, InsertResult, MatchResult, S
 KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 
 
+
+
+_CACHE_STAT: Dict[str, int] = {"req": 0, "hit": 0, "total": 0}
+
+
+def _log_cache_hit(prefix_len: int, total: int) -> None:
+    """打印本次请求的缓存命中情况 + 累计命中率。"""
+    s = _CACHE_STAT
+    s["req"] += 1
+    s["hit"] += prefix_len
+    s["total"] += total
+    rate = 100.0 * prefix_len / total if total > 0 else 0.0
+    cum = 100.0 * s["hit"] / s["total"] if s["total"] > 0 else 0.0
+    print(
+        f"[CACHE] req#{s['req']:4d}  hit={prefix_len:6d}/{total:<6d} "
+        f"{rate:6.2f}%  | cum: {s['hit']}/{s['total']} = {cum:6.2f}%",
+        flush=True,
+    )
+
+
 class RadixTreeNode:
     """Radix 树节点：代表一段连续的前缀 token 序列。
 
@@ -172,6 +192,7 @@ class RadixPrefixCache(BasePrefixCache):
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         """沿树匹配最长公共前缀，返回句柄（不修改缓存）。"""
         node, prefix_len = self._tree_walk(input_ids)
+        _log_cache_hit(prefix_len, len(input_ids))
         return MatchResult(RadixCacheHandle(prefix_len, node))
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
